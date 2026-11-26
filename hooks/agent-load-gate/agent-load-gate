@@ -1,0 +1,354 @@
+#!/usr/bin/env -S python3 -I
+"""agent-load-gate: keep Claude Code agents from overloading the machine.
+
+PreToolUse hook (matcher "Bash"). Register it in every Claude Code config home
+you use (e.g. ~/.claude/settings.json). Each agent only sees
+its own work, so five subagents can each decide to run jest at the same moment.
+This checks the whole machine before a heavy test/build/lint command starts and
+denies it, with a reason the agent can act on, when:
+  - MemAvailable is under MIN_FREE_GB (default 8), or
+  - MAX_RUNS (default 2) heavy runs are already going: live processes, plus
+    launches this hook allowed in the last CLAIM_TTL seconds, so a burst of
+    subagents starting in the same second can't all slip through.
+
+Why it exists: one agent job ran 5 test groups in parallel (jest, eslint and
+tsc on two copies each), took 28 of 30 GB of RAM, and froze the desktop.
+
+It fails open: any error lets the command run.
+
+  agent-load-gate status   print free RAM and active heavy runs; exit 0 when a
+                           new heavy run would be allowed, 1 when it would not
+Decisions on heavy commands are logged to $XDG_RUNTIME_DIR/agent-load-gate/log.
+Tune with env AGENT_LOAD_GATE_MIN_FREE_GB / AGENT_LOAD_GATE_MAX_RUNS.
+Turn it off with /hooks, or by removing it from settings.json.
+Linux only (reads /proc).
+"""
+import fcntl
+import json
+import os
+import re
+import shlex
+import sys
+import time
+
+MIN_FREE_GB = float(os.environ.get("AGENT_LOAD_GATE_MIN_FREE_GB", "8"))
+MAX_RUNS = int(os.environ.get("AGENT_LOAD_GATE_MAX_RUNS", "2"))
+CLAIM_TTL = 20  # seconds a fresh launch counts before its process is visible
+MAX_AGE = 90 * 60  # older heavy processes stop counting (forgotten watchers, stuck runs);
+                   # their RAM still counts through MemAvailable
+SELF = os.path.realpath(sys.argv[0])
+STATE = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "agent-load-gate"
+)
+
+# Tools that are heavy whenever they run (the version/help flags excepted).
+TOOLS = {"jest", "vitest", "eslint", "tsc", "vue-tsc", "playwright", "cypress",
+         "gradle", "gradlew", "webpack"}
+# Tools that are heavy only when building.
+BUILD_TOOLS = {"vite", "next", "nest", "eas"}
+PMS = {"npm", "pnpm", "yarn", "bun"}
+PM_HEAVY = {"ci", "install", "i", "test", "t", "tst"}
+PM_RUN = {"run", "run-script", "rum", "urn"}
+PM_ARG_FLAGS = {"--prefix", "-C", "--dir", "--filter", "-F", "-w", "--workspace", "--cwd"}
+SCRIPT_RE = re.compile(r"^(test|build|lint|typecheck|type-check|tsc|e2e|check)([:\-_.].*)?$")
+WRAPPERS = {"env", "time", "nice", "ionice", "command", "exec", "nohup", "stdbuf",
+            "timeout", "npx", "bunx", "pnpx", "xvfb-run", "dotenv"}
+INTERPRETERS = {"node", "nodejs", "deno"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+SEPARATORS = {"then", "do", "else", "elif", "if", "while", "until", "{", "}", "!"}
+CHEAP_FLAGS = {"--version", "-v", "-V", "--help", "-h"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+NUMLIKE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+FAST = re.compile(r"jest|vitest|eslint|tsc|playwright|cypress|gradle|webpack|build"
+                  r"|\b(npm|pnpm|yarn|bun)\b")
+HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1([^\n]*)\n(.*?)"
+                     r"(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)", re.S)
+SHELL_TAIL = re.compile(r"(^|[\s;&|(])(bash|sh|zsh|dash)(\s+-\S+)*\s*$")
+GRADLE_MAINS = {"org.gradle.wrapper.GradleWrapperMain", "org.gradle.launcher.GradleMain"}
+
+
+def base(word):
+    b = os.path.basename(word)
+    for ext in (".js", ".mjs", ".cjs", ".cmd"):
+        if b.endswith(ext):
+            return b[: -len(ext)]
+    return b
+
+
+def classify(words, proc=False):
+    """Label of the heavy command these words start, or None.
+
+    proc=True classifies a running process's argv: only the tool itself counts,
+    so wrappers (bash -c, npx, timeout, npm test) are not counted twice.
+    """
+    if proc and any(a in GRADLE_MAINS for a in words):
+        return "gradle"
+    i, n = 0, len(words)
+    while i < n:
+        w = words[i]
+        b = base(w)
+        if ASSIGN.match(w):
+            i += 1
+            continue
+        if b in WRAPPERS:
+            if proc or (b == "command" and words[i + 1:i + 2] in (["-v"], ["-V"])):
+                return None  # `command -v jest` looks a tool up, it doesn't run it
+            i += 1
+            while i < n and (words[i].startswith("-") or NUMLIKE.match(words[i])
+                             or ASSIGN.match(words[i])):
+                i += 1
+            continue
+        if b in SHELLS:
+            if proc:
+                return None
+            for j in range(i + 1, n - 1):
+                if re.match(r"^-[a-z]*c$", words[j]):
+                    return " + ".join(scan(words[j + 1])) or None
+            return None
+        if b in INTERPRETERS or (b == "bun" and i + 1 < n and "/" in words[i + 1]):
+            i += 1
+            while i < n and words[i].startswith("-"):
+                i += 1
+            continue
+        if b in PMS:
+            j = i + 1
+            while j < n and words[j].startswith("-"):
+                j += 2 if words[j] in PM_ARG_FLAGS else 1
+            if j >= n:
+                return None
+            sub = words[j]
+            if sub in ("exec", "x", "dlx"):
+                if proc:
+                    return None
+                i = j + 1
+                while i < n and words[i] == "--":
+                    i += 1
+                continue
+            if sub in ("ci", "install", "i"):
+                return f"{b} {sub}"
+            if proc:
+                return None  # npm test spawns jest; count the jest, not the npm
+            if sub in PM_HEAVY:
+                return f"{b} {sub}"
+            if sub in PM_RUN:
+                k = j + 1
+                while k < n and words[k].startswith("-"):
+                    k += 1
+                if k < n and SCRIPT_RE.match(words[k]):
+                    return f"{b} run {words[k]}"
+                return None
+            if b != "npm" and SCRIPT_RE.match(sub):
+                return f"{b} {sub}"
+            return None
+        rest = words[i + 1:]
+        if proc and (any(a in ("--watch", "--watchAll") for a in rest)
+                     or (b in ("tsc", "vue-tsc") and "-w" in rest)):
+            return None  # idle watchers; their RAM still counts via MemAvailable
+        if b in TOOLS:
+            if any(a in CHEAP_FLAGS for a in rest):
+                return None
+            if b == "playwright" and "test" not in rest[:2]:
+                return None
+            if b == "cypress" and "run" not in rest[:2]:
+                return None
+            return b
+        if b in BUILD_TOOLS and "build" in rest[:2]:
+            return f"{b} build"
+        return None
+    return None
+
+
+def strip_heredocs(cmd):
+    """Drop heredoc bodies (file contents), unless the heredoc is fed to a shell."""
+    def repl(m):
+        before = cmd[cmd.rfind("\n", 0, m.start()) + 1:m.start()]
+        if SHELL_TAIL.search(before) or re.search(r"\|\s*(bash|sh|zsh|dash)\b", m.group(3)):
+            return m.group(0)
+        return " " + m.group(3) + "\n"
+    return HEREDOC.sub(repl, cmd)
+
+
+def scan(cmd):
+    """Labels of every heavy command started by a shell command line."""
+    cmd = strip_heredocs(cmd)
+    try:
+        lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        tokens = list(lex)
+    except ValueError:  # unbalanced quotes and the like: plain split
+        tokens = re.split(r"\s+|([;&|()])", cmd)
+        tokens = [t for t in tokens if t]
+    labels, seg = [], []
+    for t in tokens + [";"]:
+        if t in SEPARATORS or (t and set(t) <= set(";&|()")):
+            if seg:
+                label = classify(seg)
+                if label:
+                    labels.append(label)
+            seg = []
+        else:
+            seg.append(t)
+    return labels
+
+
+def proc_age(pid, uptime, hz):
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return uptime - int(fields[19]) / hz
+
+
+def heavy_procs():
+    found = []
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+    hz = os.sysconf("SC_CLK_TCK")
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = [a.decode(errors="replace") for a in raw.rstrip(b"\0").split(b"\0")]
+        if len(argv) == 1 and " " in argv[0]:  # rewritten process title
+            argv = argv[0].split()
+        label = classify(argv, proc=True)
+        if label:
+            try:
+                age = proc_age(d, uptime, hz)
+            except (OSError, IndexError, ValueError):
+                continue
+            if age < MAX_AGE:
+                found.append((int(d), label, age))
+    return found
+
+
+def mem_available_gb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1048576
+    return 0.0
+
+
+def live_claims(now):
+    d = os.path.join(STATE, "claims")
+    os.makedirs(d, exist_ok=True)
+    live = 0
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(p) < CLAIM_TTL:
+                live += 1
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
+    return live
+
+
+def add_claims(now, count):
+    d = os.path.join(STATE, "claims")
+    for k in range(count):
+        open(os.path.join(d, f"{time.time_ns()}-{os.getpid()}-{k}"), "w").close()
+
+
+def log(line):
+    try:
+        p = os.path.join(STATE, "log")
+        if os.path.exists(p) and os.path.getsize(p) > 256 * 1024:
+            os.replace(p, p + ".1")
+        with open(p, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except OSError:
+        pass
+
+
+def machine_state(now):
+    procs = heavy_procs()
+    claims = live_claims(now)
+    free = mem_available_gb()
+    active = len(procs) + claims
+    busy = free < MIN_FREE_GB or active >= MAX_RUNS
+    return free, procs, claims, active, busy
+
+
+def describe(procs, claims):
+    parts = [f"{label} (pid {pid}, {int(age // 60)}m)" for pid, label, age in procs[:6]]
+    if len(procs) > 6:
+        parts.append(f"+{len(procs) - 6} more")
+    if claims:
+        parts.append(f"{claims} just launched")
+    return ", ".join(parts) or "none"
+
+
+def status():
+    os.makedirs(STATE, exist_ok=True)
+    free, procs, claims, active, busy = machine_state(time.time())
+    print(f"free RAM: {free:.1f} GB (gate needs {MIN_FREE_GB:g})")
+    print(f"heavy runs: {active} (gate allows a new one below {MAX_RUNS}): {describe(procs, claims)}")
+    print("busy: a new heavy run would be denied" if busy else "clear: a new heavy run would be allowed")
+    return 1 if busy else 0
+
+
+def hook():
+    payload = json.load(sys.stdin)
+    if payload.get("tool_name") not in (None, "Bash"):
+        return 0
+    cmd = (payload.get("tool_input") or {}).get("command") or ""
+    if not FAST.search(cmd):
+        return 0
+    labels = scan(cmd)
+    if not labels:
+        return 0
+    os.makedirs(STATE, exist_ok=True)
+    session = (payload.get("session_id") or "")[:8]
+    now = time.time()
+    with open(os.path.join(STATE, "lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        free, procs, claims, active, busy = machine_state(now)
+        if not busy:
+            add_claims(now, len(labels))
+    what = " + ".join(labels)
+    log(f"{'DENY ' if busy else 'allow'} free={free:.1f}G active={active} "
+        f"session={session} cwd={payload.get('cwd', '')} run={what} :: {cmd[:160]!r}")
+    if not busy:
+        return 0
+    reason = (
+        f"agent-load-gate: this machine is shared by several Claude sessions and "
+        f"is busy, so `{what}` was not started. Free RAM {free:.1f} GB (needs {MIN_FREE_GB:g}); "
+        f"heavy runs active: {active} (limit {MAX_RUNS}): {describe(procs, claims)}. "
+        f"Do not retry right away and do not work around this. Wait until "
+        f"`{SELF} status` exits 0 (poll it in the background, e.g. every 30-60 s), then "
+        f"run heavy steps one at a time, with jest/vitest capped at --maxWorkers=2. "
+        f"If you orchestrate subagents, make their heavy steps sequential, not parallel. "
+        f"If it is still busy after ~15 minutes, tell the user instead of waiting longer."
+    )
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": f"agent-load-gate held back `{what}`: {free:.1f} GB free, "
+                         f"{active} heavy runs active",
+    }))
+    return 0
+
+
+def main():
+    if sys.argv[1:2] == ["status"]:
+        return status()
+    try:
+        return hook()
+    except Exception as e:  # fail open
+        log(f"error (allowed): {type(e).__name__}: {e}")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

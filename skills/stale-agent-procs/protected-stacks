@@ -1,0 +1,2 @@
+# Compose projects stale-procs.sh must never list or touch.
+# One project name or glob per line, e.g.:  myapp-api
