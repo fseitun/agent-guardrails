@@ -1,0 +1,6 @@
+#!/bin/sh
+# Read-only wacli (WhatsApp CLI) for anything that finds it on PATH, agents included.
+# wacli treats the env var as "on" no matter what flags the caller passes.
+# Put this first on PATH; keep the real binary elsewhere for pairing/sync by hand.
+export WACLI_READONLY=1
+exec "${WACLI_BIN:-$HOME/.local/opt/wacli/wacli}" "$@"

@@ -1,0 +1,30 @@
+#!/bin/sh
+# wacli-send: send ONE WhatsApp text message.
+# Usage: wacli-send <recipient> <text>
+#   recipient = phone digits with country code (5491112345678),
+#               or a JID: <digits>@s.whatsapp.net, <digits>[-<digits>]@g.us
+# Pair it with a Claude Code "ask" rule, Bash(*wacli-send*), so every call needs your OK.
+# No flags pass through and names are refused, so the approval prompt always shows
+# the exact recipient and text.
+set -eu
+
+die() { echo "wacli-send: $*" >&2; exit 2; }
+
+[ "$#" -eq 2 ] || die "usage: wacli-send <phone-digits|JID> <text>"
+to=$1
+text=$2
+
+digits_only() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+case $to in
+  *@s.whatsapp.net) digits_only "${to%@s.whatsapp.net}" || die "bad JID: $to" ;;
+  *@g.us)
+    local_part=${to%@g.us}
+    case $local_part in '' | *[!0-9-]* | -* | *-) die "bad group JID: $to" ;; esac ;;
+  *) digits_only "$to" || die "recipient must be phone digits or a JID, not a name: $to" ;;
+esac
+
+[ -n "$text" ] || die "empty message"
+
+unset WACLI_READONLY
+exec "${WACLI_BIN:-$HOME/.local/opt/wacli/wacli}" send text --to="$to" --message="$text"
